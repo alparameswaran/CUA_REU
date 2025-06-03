@@ -1,0 +1,253 @@
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+from scipy.optimize import fsolve
+from scipy.integrate import quad
+
+class ElectronProtonScattering:
+    def __init__(self):
+        self.alpha = 1/137.036 #Fine structure constant
+        self.mp = 0.938272 #GeV
+        self.me = 0.000511 #GeV
+        self.hbarc = 0.197327 #units: GeV * fm
+
+    def dipole_form_factor(self, Q2):
+        Lambda2 = 0.71 #GeV^2 (dipole mass squared)
+        return (1+Q2/Lambda2)**(-2)
+    
+    def rosenbluth_cross_section(self, E_initial, theta):
+        """Rosenbluth formula for e-p elastic scattering differential cross section"""
+        
+        #Scattered electron energy (elastic kinematics)
+        E_final = E_initial/(1+(2*E_initial/self.mp)*np.sin(theta/2)**2)
+
+        #Momentum Transfer squared (Q^2)
+        Q2 = 4*E_initial*E_final*np.sin(theta/2)**2
+
+        #Rosenbluth section factor
+        Rosen_0 = (self.alpha*np.cos(theta/2))**2 / (4*E_initial**2*np.sin(theta/2)**4)
+
+        GE = self.dipole_form_factor(Q2)
+        GM = 2.79*self.dipole_form_factor(Q2) #2.79 is proton magnetic moment
+
+        tau = Q2 / (4 * self.mp**2)
+        epsilon = 1/(1+2*(1+tau)*np.tan(theta/2)**2)
+
+        #Rosenbluth separation formula
+        cross_section = Rosen_0 * (E_final/E_initial) * (GE**2 + tau*GM**2)/(1+tau) * epsilon
+
+        #Convert to millibarns
+        return cross_section * (self.hbarc * 1000)**2 #mb/sr/GeV
+    
+    def rosenbluth_cross_section_custom(self, E_initial, theta, GE_func, GM_func):
+        """Calculate Rosenbluth cross section with custom form factors"""
+        
+        #Scattered electron energy (elastic kinematics)
+        E_final = E_initial/(1+(2*E_initial/self.mp)*np.sin(theta/2)**2)
+        
+        #Momentum Transfer squared (Q^2)
+        Q2 = 4*E_initial*E_final*np.sin(theta/2)**2
+        
+        #Rosenbluth section factor
+        Rosen_0 = (self.alpha*np.cos(theta/2))**2 / (4*E_initial**2*np.sin(theta/2)**4)
+        
+        #Use custom form factors
+        GE = GE_func(Q2)
+        GM = GM_func(Q2)
+        tau = Q2 / (4 * self.mp**2)
+        epsilon = 1/(1+2*(1+tau)*np.tan(theta/2)**2)
+        
+        #Rosenbluth separation
+        cross_section = Rosen_0 * (E_final/E_initial) * (GE**2 + tau*GM**2)/(1+tau) * epsilon
+        
+        #Convert to millibarns
+        return cross_section #* (self.hbarc * 1000)**2
+    
+    def sample_theta_rosenbluth(self, E_beam, theta_min, theta_max):
+        """Sample scattering angle using Rosenbluth cross section for importance sampling"""
+
+        #Create cumulative distribution function
+        n_points = 1000
+        theta_array = np.linspace(theta_min, theta_max, n_points)
+
+        #Compute unnormalized probabilities with Rosenbluth cross section times sin(theta)
+        prob = np.array([self.rosenbluth_cross_section(E_beam, theta)*np.sin(theta) for theta in theta_array])
+
+        cumulative_prob = np.cumsum(prob)
+        #Divide by total sum to get relative probabilities
+        cumulative_prob = cumulative_prob / cumulative_prob[-1]
+
+        #Get random number and find corresponding theta
+        r = random.random()
+        i = np.searchsorted(cumulative_prob, r)
+
+        #Edge cases
+        if i >= len(theta_array):
+            i = len(theta_array)-1
+        elif i == 0:
+            i = 1
+
+        #Linear interpolation between points
+        r1 = cumulative_prob[i-1]
+        r2 = cumulative_prob[i]
+
+        t1 = theta_array[i-1]
+        t2 = theta_array[i]
+
+        theta = t1 + (t2-t1)*(r-r1) / (r2 - r1)
+        return theta
+
+    def output_kinematics(self, E_initial, theta):
+        """Full kinematics for elastic scattering"""
+
+        #Scattered electron energy
+        E_final = E_initial / (1+(2*E_initial/self.mp)*np.sin(theta/2)**2)
+
+        #Scattered electron momentum
+        p_final = np.sqrt(E_final**2 - self.me**2)
+
+        #Momentum transfer
+        Q2 = 4*E_initial*E_final*np.sin(theta/2)**2
+
+        return E_final, p_final, Q2
+    
+    def generate_weights(self, E_initial, theta, theta_min, theta_max):
+        #Generate proper Monte Carlo weights for importance sampling
+        
+        # Calculate the cross section that was used for sampling
+        weight = self.rosenbluth_cross_section(E_initial, theta)
+        theta = np.linspace(0,1)
+
+
+
+        #arccos(-1,1), e_final, dsigma: take rosenbluth cross
+        #If np.random.uniform(0,1) <dsigma/1e-04, then Q2 = fourmom transferred (essentially take the point). Else, return none
+        #This is for i in range of the number of points
+        # Calculate the "true" cross section for weighting
+       # if true_GE is not None and true_GM is not None:
+       #     true_xs = self.rosenbluth_cross_section_custom(E_initial, theta, true_GE, true_GM)
+            # Weight is the ratio of true to sampling cross section
+       #     weight = true_xs / sampling_xs if sampling_xs > 0 else 0
+       # else:
+            # If using same form factors, weight is 1 (since we already sampled according to the right distribution)
+       #     weight = 1.0
+        
+        return weight
+
+    def generate_events(self, E_initial, theta_min, theta_max, n_events, true_GE=None, true_GM=None):
+        #Generate Monte Carlo events with Rosenbluth importance sampling
+
+        events = []
+
+        for x in range(n_events):
+            theta = self.sample_theta_rosenbluth(E_initial, theta_min, theta_max)
+
+            # Calculate full kinematics
+            E_final, p_final, Q2 = self.output_kinematics(E_initial, theta)
+
+            # Calculate proper physics-based weight
+            weight = self.generate_weights(E_initial, theta, theta_min, theta_max)
+
+            # Sample azimuthal angle uniformly
+            phi = 2*np.pi*np.random.uniform(-1, 1)
+
+            # Create the event dictionary
+            event = {
+                'theta': theta,
+                'phi': phi,
+                'weight': weight,
+                'E_scattered': E_final,
+                'p_scattered': p_final,
+                'Q2': Q2
+            }
+
+            events.append(event)
+
+        print("Event generation complete")
+        return events
+
+    def analyze_events(self, events, E_initial):
+        """Analyze generated events and create plots"""
+        
+        # Extract data
+        thetas      = [e['theta']      for e in events]
+        weights     = [e['weight']     for e in events]
+        Q2_values   = [e['Q2']         for e in events]
+        E_scattered= [e['E_scattered'] for e in events]
+        p_scattered= [e['p_scattered'] for e in events]
+
+        # Build the new quantity E_final * dσ/dΩ
+        rosen_compute = [ e_sc * self.rosenbluth_cross_section(E_initial, theta)
+                          for e_sc, theta in zip(E_scattered, thetas) ]
+
+        # 3x2 grid of plots
+        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+        ( (ax1, ax2), (ax3, ax4), (ax5, ax6) ) = axes
+
+        # 1) Scattering angle
+        ax1.hist(np.degrees(thetas), bins=50, weights=weights, density=True, alpha=0.7)
+        ax1.set(xlabel='Scattering Angle (°)', ylabel='Weighted (norm.)',
+                title='Angle Distribution'); ax1.grid(alpha=0.3)
+
+        # 2) Q²
+        ax2.hist(Q2_values, bins=50, weights=weights, density=True, alpha=0.7)
+        ax2.set(xlabel='Q² (GeV²)', ylabel='Weighted (norm.)',
+                title='Momentum Transfer'); ax2.grid(alpha=0.3)
+
+        # 3) Scattered energy
+        ax3.hist(E_scattered, bins=50, weights=weights, density=True, alpha=0.7)
+        ax3.set(xlabel='E_scattered (GeV)', ylabel='Weighted (norm.)',
+                title='Energy Distribution'); ax3.grid(alpha=0.3)
+
+        # 4) Weights
+        ax4.hist(weights, bins=50, alpha=0.7)
+        ax4.set(xlabel='Event Weight', ylabel='Counts',
+                title='Weight Distribution'); ax4.grid(alpha=0.3)
+
+        # 5) Scattered momentum
+        ax5.hist(p_scattered, bins=50, weights=weights, density=True, alpha=0.7)
+        ax5.set(xlabel='p_scattered (GeV/c)', ylabel='Weighted (norm.)',
+                title='Momentum Distribution'); ax5.grid(alpha=0.3)
+
+        # 6) E_final × dσ/dΩ
+        ax6.hist(rosen_compute, bins=50, weights=weights, density=True, alpha=0.7)
+        ax6.set(xlabel=r'$E_{\!f}\,\frac{d\sigma}{d\Omega}$',
+                ylabel='Weighted (norm.)',
+                title=r'$E_f \times \frac{d\sigma}{d\Omega}$'); ax6.grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+def main():
+    FastMC = ElectronProtonScattering()
+
+    # Physics parameters
+    E_initial = 4.0 #GeV
+    theta_min = np.radians(2)   # Start at 5 degrees to avoid very forward scattering
+    theta_max = np.radians(120.0) # End at 120 degrees for better statistics
+    n_events = 10000  # Increased for better statistics
+
+    print("=" * 60)
+    print("ELECTRON-PROTON ELASTIC SCATTERING MONTE CARLO")
+    print("Using Rosenbluth Importance Sampling")
+    print("=" * 60)
+
+    # Generate events with standard dipole form factors
+    print(f"\n{'='*20} STANDARD SIMULATION {'='*20}")
+    events = FastMC.generate_events(E_initial, theta_min, theta_max, n_events)
+    # Example: Test with modified form factors
+    def custom_GE(Q2):
+        return FastMC.dipole_form_factor(Q2)  
+
+    def custom_GM(Q2):
+        return FastMC.dipole_form_factor(Q2)*2.79
+    
+
+    # Generate events with custom form factors
+    events = FastMC.generate_events(E_initial, theta_min, theta_max, n_events, 
+                                true_GE=custom_GE, true_GM=custom_GM)
+
+    FastMC.analyze_events(events, E_initial)
+
+if __name__ == "__main__":
+    main()
