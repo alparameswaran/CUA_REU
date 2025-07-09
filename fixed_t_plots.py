@@ -22,10 +22,15 @@ top_zip_path = r"C:\Users\Sweetie Pie\Desktop\CUA REU\meson-strcutrue-2025-06-05
 extract_root = 'meson_temp_extract'
 
 # Analysis configuration
-SAVE_PLOTS = True
+SAVE_PLOTS = False
 SHOW_PLOTS = True
 DEVIATION_THRESHOLDS = [15, 10, 5]  # Percentage thresholds for acceptance
 T_BINS = 40  # Number of bins for -t axis
+
+# PARTICLE MASSES (GeV)
+M_LAMBDA = 1.115683  # Lambda mass
+M_PROTON = 0.938272  # Proton mass (for target)
+M_ELECTRON = 0.000511  # Electron mass
 
 # =============================================================================
 # DATA LOADING AND PROCESSING FUNCTIONS
@@ -36,22 +41,26 @@ def parse_filename(filename):
     name = filename.replace('.csv.zip', '')
     parts = name.split('.')
     
+    if len(parts) != 2:
+        return None, None, None, None
     
     base_name, file_type = parts
     base_parts = base_name.split('_')
     
+    if len(base_parts) != 5:
+        return None, None, None, None
     
     # k_lambda_5x41_5000evt_001 -> kinematics=5x41, event_number=001
     process_name = '_'.join(base_parts[:2])  # k_lambda
     kinematics = base_parts[2]  # 5x41, 10x100, or 18x275
     event_number = base_parts[4]  # 001-200
     
-    # Map file types (note: reco_dis not recon_dis)
+    #Map file types
     if file_type == 'mc_dis':
         data_type = 'mc_dis'
     elif file_type == 'mcpart_lambda':
         data_type = 'mc_part'
-    elif file_type == 'reco_dis':  # Fixed: was recon_dis
+    elif file_type == 'reco_dis':  
         data_type = 'recon'
     else:
         data_type = None
@@ -59,7 +68,7 @@ def parse_filename(filename):
     return process_name, kinematics, event_number, data_type
 
 def load_csv_from_zip(zip_path):
-    """Load CSV from zip file"""
+    #Load CSV from zip file
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
             csv_name = next((name for name in z.namelist() if name.endswith('.csv')), None)
@@ -192,6 +201,11 @@ def load_and_process_data():
             combined_data[kinematics] = {'merged': full_merged}
             print(f"  Successfully aligned {len(full_merged)} events across all three file types")
             
+            # Check for lambda momentum columns
+            lambda_cols = ['lam_px', 'lam_py', 'lam_pz']
+            lambda_cols_found = [col for col in lambda_cols if col in full_merged.columns]
+            print(f"    ✓ Lambda momentum columns found: {len(lambda_cols_found)}/{len(lambda_cols)}")
+            
             # Check for tprime column
             if 'tprime' in full_merged.columns:
                 print(f"    ✓ tprime column found with {(~pd.isna(full_merged['tprime'])).sum()} valid values")
@@ -213,10 +227,120 @@ def get_beam_energy_from_kinematics(kinematics):
         return 18.0
     elif kinematics.startswith('5x'):
         return 5.0
+    else:
+        print(f"Warning: Unknown kinematics {kinematics}, defaulting to 5.0 GeV")
+        return 5.0
+
+def calculate_virtual_photon_4momentum(Q2, nu, beam_energy):
+    """
+    Calculate virtual photon 4-momentum from Q2 and nu
+    
+    Parameters:
+    Q2 : float or array
+        Virtual photon Q² (positive)
+    nu : float or array  
+        Energy transfer ν
+    beam_energy : float
+        Beam energy in GeV
+        
+    Returns:
+    tuple : (E_gamma, px, py, pz) - virtual photon 4-momentum
+    """
+    # Virtual photon energy
+    E_gamma = nu
+    
+    # Virtual photon momentum magnitude
+    # For virtual photon: q² = E² - |q|² = -Q² (timelike)
+    # So |q|² = E² + Q² = ν² + Q²
+    q_mag = np.sqrt(nu**2 + Q2)
+    
+    # Assume beam along z-axis, scattered electron in x-z plane
+    # Virtual photon momentum is approximately in -z direction for small angles
+    # For more precise calculation, would need scattered electron angles
+    px_gamma = 0.0  # Simplified assumption
+    py_gamma = 0.0  # Simplified assumption  
+    pz_gamma = -q_mag  # Momentum transfer is roughly along beam direction
+    
+    return E_gamma, px_gamma, py_gamma, pz_gamma
+
+def calculate_t_from_lambda_4vectors(data, mask, kinematics):
+    """
+    Calculate momentum transfer squared t from lambda 4-vectors and virtual photon kinematics.
+    
+    t = (q - p_lambda)² where q is virtual photon and p_lambda is lambda 4-momentum
+    
+    Parameters:
+    data : DataFrame
+        Merged data containing MC_DIS and MC_PART data
+    mask : array-like
+        Boolean mask for valid events
+    kinematics : str
+        Kinematics identifier to get beam energy
+        
+    Returns:
+    array-like
+        -t values calculated from 4-vectors (absolute values)
+    """
+    # Get beam energy
+    beam_energy = get_beam_energy_from_kinematics(kinematics)
+    
+    #Check required columns
+    required_lambda_cols = ['lam_px', 'lam_py', 'lam_pz']
+    required_dis_cols = ['q2', 'nu']
+    
+    missing_lambda = [col for col in required_lambda_cols if col not in data.columns]
+    missing_dis = [col for col in required_dis_cols if col not in data.columns]
+    
+    if missing_lambda:
+        raise ValueError(f"Missing lambda momentum columns: {missing_lambda}")
+    if missing_dis:
+        raise ValueError(f"Missing DIS columns: {missing_dis}")
+    
+    # Extract data for masked events
+    n_events = mask.sum()
+    print(f"Calculating t for {n_events} events")
+    
+    # Lambda 4-momentum components
+    lam_px = data['lam_px'].values[mask]
+    lam_py = data['lam_py'].values[mask]  
+    lam_pz = data['lam_pz'].values[mask]
+    
+    # Calculate lambda energy
+    lam_E = np.sqrt(lam_px**2 + lam_py**2 + lam_pz**2 + M_LAMBDA**2)
+    
+    # Virtual photon kinematics
+    Q2 = data['q2'].values[mask]
+    nu = data['nu'].values[mask]
+    
+    # Calculate virtual photon 4-momentum
+    gamma_E, gamma_px, gamma_py, gamma_pz = calculate_virtual_photon_4momentum(Q2, nu, beam_energy)
+    
+    # Calculate t = (q - p_lambda)²
+    # t = (E_gamma - E_lambda)² - (px_gamma - px_lambda)² - (py_gamma - py_lambda)² - (pz_gamma - pz_lambda)²
+    delta_E = gamma_E - lam_E
+    delta_px = gamma_px - lam_px  # gamma_px = 0 in our approximation
+    delta_py = gamma_py - lam_py  # gamma_py = 0 in our approximation  
+    delta_pz = gamma_pz - lam_pz
+    
+    t = delta_E**2 - delta_px**2 - delta_py**2 - delta_pz**2
+    
+    # Return -t (positive values)
+    minus_t = -t
+    
+    # Filter out unphysical values
+    valid_t = np.isfinite(minus_t) & (minus_t > 0)
+    print(f"Valid -t values: {valid_t.sum()}/{len(minus_t)}")
+    
+    if valid_t.sum() > 0:
+        print(f"-t range: {minus_t[valid_t].min():.6f} to {minus_t[valid_t].max():.6f} GeV²")
+        print(f"-t mean: {minus_t[valid_t].mean():.6f} GeV²")
+    
+    return minus_t
 
 def calculate_t_from_kinematics(data, mask, kinematics=None):
     """
-    Extract -t from tprime column in MC_DIS data.
+    Calculate -t using both methods: from lambda 4-vectors and from tprime column.
+    Compare the results for validation.
     
     Parameters:
     data : DataFrame
@@ -224,26 +348,50 @@ def calculate_t_from_kinematics(data, mask, kinematics=None):
     mask : array-like
         Boolean mask for valid events
     kinematics : str
-        Kinematics identifier (kept for compatibility)
+        Kinematics identifier
         
     Returns:
     array-like
-        -t values from tprime column (absolute values)
+        -t values calculated from lambda 4-vectors
     """
-    if 'tprime' not in data.columns:
-        # Look for alternative tprime column names
-        t_cols = [col for col in data.columns if 'tprime' in col.lower() or col.lower() == 'tprime']
-        if t_cols:
-            t_col = t_cols[0]
-            print(f"Using column '{t_col}' for tprime")
-        else:
-            available_cols = [col for col in data.columns if 't' in col.lower()]
-            raise ValueError(f"tprime column not found in data. Columns with 't': {available_cols}")
-    else:
-        t_col = 'tprime'
+    print(f"\nCalculating -t for {kinematics} using lambda 4-vectors...")
     
-    tprime_values = data[t_col].values[mask]
-    return np.abs(tprime_values)
+    # Method 1: Calculate from lambda 4-vectors
+    try:
+        t_from_4vectors = calculate_t_from_lambda_4vectors(data, mask, kinematics)
+    except ValueError as e:
+        print(f"Error calculating t from 4-vectors: {e}")
+        # Fallback to tprime method
+        if 'tprime' in data.columns:
+            print("Falling back to tprime column...")
+            tprime_values = data['tprime'].values[mask]
+            return np.abs(tprime_values)
+        else:
+            raise e
+    
+    # Method 2: Compare with tprime if available
+    if 'tprime' in data.columns:
+        tprime_values = np.abs(data['tprime'].values[mask])
+        
+        # Compare the two methods
+        valid_both = np.isfinite(t_from_4vectors) & np.isfinite(tprime_values) & (t_from_4vectors > 0) & (tprime_values > 0)
+        
+        if valid_both.sum() > 10:
+            correlation = np.corrcoef(t_from_4vectors[valid_both], tprime_values[valid_both])[0, 1]
+            relative_diff = np.abs(t_from_4vectors[valid_both] - tprime_values[valid_both]) / tprime_values[valid_both]
+            mean_rel_diff = np.mean(relative_diff)
+            
+            print(f"Validation against tprime:")
+            print(f"  Correlation: {correlation:.4f}")
+            print(f"  Mean relative difference: {mean_rel_diff:.4f} ({mean_rel_diff*100:.2f}%)")
+            print(f"  Valid comparison points: {valid_both.sum()}")
+            
+            if correlation < 0.8 or mean_rel_diff > 0.5:
+                print("  ⚠️  WARNING: Large discrepancy between methods!")
+            else:
+                print("  ✓ Good agreement between methods")
+    
+    return t_from_4vectors
 
 def define_reconstruction_success_by_deviation(mc_values, recon_values, deviation_percent, variable='X'):
     """Define reconstruction success based on percent deviation from true value"""
@@ -263,7 +411,7 @@ def define_reconstruction_success_by_deviation(mc_values, recon_values, deviatio
 def create_acceptance_deviation_plots_electron_only(combined_data, variable='X', deviations=[15, 10, 5], t_bins=40, figsize=(16, 12)):
     """
     Create acceptance vs -t plots for different deviation thresholds using ONLY Electron Method.
-    
+    Now calculates -t from lambda 4-vectors instead of just reading tprime.
     """
     
     # Electron method column mapping
@@ -291,7 +439,7 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
     n_deviations = len(deviations)
     
     fig, axes = plt.subplots(n_kinematics, n_deviations, figsize=figsize, squeeze=False)
-    fig.suptitle(f'Acceptance vs -t: {variable}', fontsize=16, y=0.95)
+    fig.suptitle(f'Acceptance vs -t: {variable} (MCLambda 4-vectors)', fontsize=16, y=0.95)
     
     colors = ['red', 'blue', 'green']
     all_results = {}
@@ -315,40 +463,45 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
                 axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
             continue
         
-        # Check for tprime column
-        if 'tprime' not in data.columns:
-            # Look for alternative column names
-            t_cols = [col for col in data.columns if 'tprime' in col.lower()]
-            if not t_cols:
-                for col in range(n_deviations):
-                    axes[row, col].text(0.5, 0.5, f'Missing tprime column\nin MC_DIS data', 
-                                       transform=axes[row, col].transAxes, ha='center', va='center',
-                                       bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
-                    axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
-                continue
+        # Check for required lambda and DIS columns
+        required_cols = ['lam_px', 'lam_py', 'lam_pz', 'q2', 'nu']
+        missing_cols = [col for col in required_cols if col not in data.columns]
         
-        # Calculate -t values directly from tprime column
+        if missing_cols:
+            for col in range(n_deviations):
+                axes[row, col].text(0.5, 0.5, f'Missing columns for\n-t calculation:\n{missing_cols}', 
+                                   transform=axes[row, col].transAxes, ha='center', va='center',
+                                   bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+                axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
+            continue
+        
+        # Calculate -t values from lambda 4-vectors
         # We use electron method kinematics for valid event selection
         Q2, x, y = data['electron_q2'], data['electron_x'], data['electron_y']
         valid_kinematics = ((Q2 > 0) & (x > 0) & (x < 1) & (y > 0) & (y < 1))
         
-        if valid_kinematics.sum() < 100:
+        # Also check for valid lambda momentum
+        valid_lambda = (np.isfinite(data['lam_px']) & np.isfinite(data['lam_py']) & 
+                       np.isfinite(data['lam_pz']) & np.isfinite(data['q2']) & 
+                       np.isfinite(data['nu']))
+        
+        valid_events = valid_kinematics & valid_lambda
+        
+        if valid_events.sum() < 100:
             for col in range(n_deviations):
-                axes[row, col].text(0.5, 0.5, f'Insufficient data\n({valid_kinematics.sum()} events)', 
+                axes[row, col].text(0.5, 0.5, f'Insufficient data\n({valid_events.sum()} events)', 
                                    transform=axes[row, col].transAxes, ha='center', va='center')
                 axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
             continue
         
-        # Extract -t from tprime column
-        print(f"\nExtracting -t for {kinematics} from tprime column in MC_DIS data...")
+        # Calculate -t from lambda 4-vectors
         t_values = np.full(len(data), np.nan)
         try:
-            t_values[valid_kinematics] = calculate_t_from_kinematics(
-                data, valid_kinematics, kinematics
-            )
+            t_calculated = calculate_t_from_kinematics(data, valid_events, kinematics)
+            t_values[valid_events] = t_calculated
         except ValueError as e:
             for col in range(n_deviations):
-                axes[row, col].text(0.5, 0.5, f'Error extracting tprime:\n{str(e)}', 
+                axes[row, col].text(0.5, 0.5, f'Error calculating -t:\n{str(e)}', 
                                    transform=axes[row, col].transAxes, ha='center', va='center',
                                    bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
                 axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
@@ -356,17 +509,17 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
         
         # Check that -t extraction was successful
         valid_t = np.isfinite(t_values) & (t_values > 0)
-        print(f"Successfully extracted -t for {valid_t.sum()}/{len(data)} events")
+        print(f"Successfully calculated -t for {valid_t.sum()}/{len(data)} events")
         
         mc_values = data[mc_col].values
         electron_values = data[electron_col].values  # Use ONLY electron method
         
         # Base selection
-        base_valid = (valid_kinematics & valid_t & np.isfinite(mc_values))
+        base_valid = (valid_events & valid_t & np.isfinite(mc_values))
         
         if base_valid.sum() < 100:
             for col in range(n_deviations):
-                axes[row, col].text(0.5, 0.5, 'No valid events\nafter -t extraction', 
+                axes[row, col].text(0.5, 0.5, 'No valid events\nafter -t calculation', 
                                    transform=axes[row, col].transAxes, ha='center', va='center')
                 axes[row, col].set_title(f'{kinematics}: {deviations[col]}%')
             continue
@@ -422,7 +575,7 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
             ax.errorbar(valid_t_centers, acceptances, yerr=acceptance_errors,
                        fmt='o-', color=color, capsize=3, markersize=4, alpha=0.8, linewidth=2)
             
-            ax.set_xlabel('-t (GeV²) [from tprime]')
+            ax.set_xlabel('-t (GeV²) [from λ 4-vectors]')
             ax.set_ylabel('Acceptance (Electron Method)')
             ax.set_title(f'{kinematics}: ±{deviation}% tolerance')
             ax.grid(True, alpha=0.3)
@@ -436,9 +589,6 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
             )
             overall_acceptance = overall_success.sum() / total_mc
             
-            ax.text(0.05, 0.95, f'Mean: {mean_acceptance:.3f}\nOverall: {overall_acceptance:.3f}\nElectron Method\n-t from MC_DIS', 
-                   transform=ax.transAxes, verticalalignment='top',
-                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8), fontsize=9)
             
             all_results[kinematics][f'{deviation}%'] = {
                 't_centers': valid_t_centers,
@@ -449,7 +599,7 @@ def create_acceptance_deviation_plots_electron_only(combined_data, variable='X',
                 'total_events': total_mc,
                 'successful_events': overall_success.sum(),
                 'method': 'Electron Method',
-                't_from_mc_dis': True  # Flag to indicate -t was read from MC_DIS tprime column
+                't_from_lambda_4vectors': True  # Flag to indicate -t was calculated from lambda 4-vectors
             }
     
     plt.tight_layout()
@@ -459,7 +609,7 @@ def print_deviation_summary(all_results, variable='X'):
     """Print numerical summary of results"""
     print("\n" + "="*80)
     print(f"ACCEPTANCE ANALYSIS SUMMARY: {variable} RECONSTRUCTION QUALITY (ELECTRON METHOD)")
-    print("NOTE: -t values are extracted from tprime column in MC_DIS data")
+    print("NOTE: -t values are calculated from lambda 4-vectors and virtual photon kinematics")
     print("="*80)
     
     deviations = [f'{d}%' for d in DEVIATION_THRESHOLDS]
@@ -486,26 +636,16 @@ def print_deviation_summary(all_results, variable='X'):
 # =============================================================================
 
 def main():
-    """Main function to run the complete analysis"""
     print("="*80)
     print("ELECTRON METHOD ACCEPTANCE vs -t ANALYSIS")
-    print("(-t extracted from tprime column in MC_DIS data)")
     print("="*80)
     print(f"Data file: {top_zip_path}")
     print(f"Deviation thresholds: {DEVIATION_THRESHOLDS}%")
     print(f"Number of -t bins: {T_BINS}")
-    print("NOTE: -t values are extracted from tprime column in MC_DIS data")
-    print("NOTE: Three file types per event: MC_DIS, MC_PART, RECON")
-    print("="*80)
     
     try:
         # Load and process data
         combined_data = load_and_process_data()
-        
-        if not combined_data:
-            print("❌ No properly aligned data found!")
-            print("Check that MC_DIS, MC_PART, and reconstruction files exist for the same events.")
-            return
         
         available_kinematics = sorted(combined_data.keys())
         print(f"\n✓ Available kinematics: {available_kinematics}")
@@ -519,21 +659,27 @@ def main():
             
             # Check for electron method data
             electron_cols = ['electron_x', 'electron_q2', 'electron_y', 'electron_w', 'electron_nu']
-            available_electron_cols = [col for col in electron_cols if col in merged_data.columns]
-            print(f"  Available electron method columns: {len(available_electron_cols)}/{len(electron_cols)}")
-            if len(available_electron_cols) < len(electron_cols):
-                missing = [col for col in electron_cols if col not in merged_data.columns]
-                print(f"    Missing: {missing}")
             
-            # Check for tprime column from MC_DIS
-            if 'tprime' in merged_data.columns:
-                print("    ✓ tprime column found for -t extraction")
-                valid_tprime = np.isfinite(merged_data['tprime']) & (merged_data['tprime'] != 0)
-                print(f"    Valid tprime values: {valid_tprime.sum()}/{len(merged_data)}")
+            # Check for lambda momentum columns
+            lambda_cols = ['lam_px', 'lam_py', 'lam_pz']
+            available_lambda_cols = [col for col in lambda_cols if col in merged_data.columns]
+            print(f"  Available lambda momentum columns: {len(available_lambda_cols)}/{len(lambda_cols)}")
+            
+            # Check for DIS kinematic columns
+            dis_cols = ['q2', 'nu']
+            available_dis_cols = [col for col in dis_cols if col in merged_data.columns]
+            print(f"  Available DIS columns: {len(available_dis_cols)}/{len(dis_cols)}")
+            
+            if len(available_lambda_cols) == len(lambda_cols) and len(available_dis_cols) == len(dis_cols):
+                print("    ✓ All required columns found for -t calculation from 4-vectors")
+                
+                # Show some statistics
+                valid_lambda = (np.isfinite(merged_data['lam_px']) & 
+                               np.isfinite(merged_data['lam_py']) & 
+                               np.isfinite(merged_data['lam_pz']))
+                print(f"    Valid lambda events: {valid_lambda.sum()}/{len(merged_data)}")
             else:
-                print("    ❌ tprime column not found")
-                t_columns = [col for col in merged_data.columns if 't' in col.lower()]
-                print(f"    Available columns with 't': {t_columns}")
+                print("    ❌ Missing required columns for -t calculation")
         
         # Run acceptance analysis for different variables
         variables_to_analyze = ['X', 'Q2', 'Y']  # Can add 'W', 'NU' if needed
@@ -541,7 +687,7 @@ def main():
         for variable in variables_to_analyze:
             print(f"\n{'='*60}")
             print(f"ANALYZING {variable} RECONSTRUCTION QUALITY (ELECTRON METHOD)")
-            print(f"(-t extracted from tprime column in MC_DIS data)")
+            print(f"(-t calculated from lambda 4-vectors and virtual photon kinematics)")
             print(f"{'='*60}")
             
             # Create acceptance vs -t plots
@@ -553,7 +699,7 @@ def main():
             )
             
             if fig is not None and SAVE_PLOTS:
-                filename = f'acceptance_vs_t_{variable.lower()}_electron_method_mc_dis_tprime.png'
+                filename = f'acceptance_vs_t_{variable.lower()}_electron_method_lambda_4vectors.png'
                 fig.savefig(filename, dpi=300, bbox_inches='tight')
                 print(f"✓ Saved: {filename}")
             
@@ -573,8 +719,7 @@ def main():
         print(f"{'='*80}")
         print(f"✓ Generated acceptance vs -t plots for variables: {variables_to_analyze}")
         print(f"✓ Used deviation thresholds: ±{DEVIATION_THRESHOLDS}%")
-        print("✓ All plots use the Electron Method reconstruction algorithm")
-        print("✓ All -t values were extracted from tprime column in MC_DIS data")
+        print("✓ All -t values were calculated from lambda 4-vectors and virtual photon")
         print("✓ Data properly aligned across MC_DIS, MC_PART, and RECON files")
         if SAVE_PLOTS:
             print("✓ Plots saved as PNG files in the current directory")
