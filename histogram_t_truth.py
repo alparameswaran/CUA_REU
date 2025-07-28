@@ -1,322 +1,464 @@
-import zipfile
-import os
+# EDM4eic ROOT File Analysis for Mandelstam -t Calculation
+# 
+# This script processes .edm4eic.root files containing k_lambda events
+# and calculates Mandelstam -t values from proton and lambda 4-vectors.
+#
+# Key features:
+# - Extracts beam protons using MCBeamProtons_objIdx indices
+# - Extracts lambdas from MCParticles collection using PDG filtering
+# - Calculates -t = -(p_beam_proton - p_lambda)^2 for MC particles
+# - Processes all files from k_lambda_18x275_5000evt_001.edm4eic.root to _110.edm4eic.root
+# - Outputs combined CSV and diagnostic plots
+
+import uproot
 import pandas as pd
-import tempfile
-import shutil
-import matplotlib.pyplot as plt
 import numpy as np
-from collections import defaultdict
-import warnings
-warnings.filterwarnings('ignore')
+import matplotlib.pyplot as plt
+import os
+from glob import glob
 
-# CONFIGURATION
-# Path to main zip file containing the data
-top_zip_path = r"C:\Users\Sweetie Pie\Desktop\CUA REU\meson-strcutrue-2025-06-05-csv-20250623T143248Z-1-001.zip"
-extract_root = 'meson_temp_extract'
+# === Updated Paths for EDM4eic files ===
+# WSL path
+#edm4eic_dir = "/mnt/c/Users/Sweetie Pie/Desktop/CUA REU/edm4eic"
 
-# PARTICLE MASSES (GeV)
-M_LAMBDA = 1.115683  # Lambda mass
+edm4eic_dir = "C:\\Users\\Sweetie Pie\\Desktop\\CUA REU\\edm4eic"
 
-# =============================================================================
-# DATA LOADING FUNCTIONS
-# =============================================================================
 
-def parse_filename(filename):
-    """Parse filename to extract metadata"""
-    name = filename.replace('.csv.zip', '')
-    parts = name.split('.')
-    
-    if len(parts) != 2:
-        return None, None, None, None
-    
-    base_name, file_type = parts
-    base_parts = base_name.split('_')
-    
-    if len(base_parts) != 5:
-        return None, None, None, None
-    
-    process_name = '_'.join(base_parts[:2])  # k_lambda
-    kinematics = base_parts[2]  # 5x41, 10x100, or 18x275
-    event_number = base_parts[4]  # 001-200
-    
-    # Map file types
-    if file_type == 'mc_dis':
-        data_type = 'mc_dis'
-    elif file_type == 'mcpart_lambda':
-        data_type = 'mc_part'
-    elif file_type == 'reco_dis':  
-        data_type = 'recon'
-    else:
-        data_type = None
-    
-    return process_name, kinematics, event_number, data_type
+# Physical constants and PDG codes
+mass_lambda = 1.1156  # Lambda mass in GeV
+mass_proton = 0.93827203  # Proton mass in GeV
+PDG_PROTON = 2212  # Proton PDG code
+PDG_LAMBDA = 3122  # Lambda PDG code
 
-def load_csv_from_zip(zip_path):
-    """Load CSV from zip file"""
+def mandelstam_t(p_proton, p_lambda):
+    q = p_proton - p_lambda
+    return q[0]**2 - np.sum(q[1:]**2)
+
+def get_mc_particles_4vectors(tree, n_events, pdg_filter=None):
+    """
+    Extract 4-vectors from MCParticles collection
+    
+    Args:
+        tree: uproot tree object
+        n_events: number of events to process (from main function)
+        pdg_filter: PDG code to filter particles (e.g., 2212 for proton, 3122 for lambda)
+    
+    Returns:
+        four_vectors: array of 4-vectors [E, px, py, pz] for each event
+        selected_indices: list of particle indices used for each event
+    """
     try:
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            csv_name = next((name for name in z.namelist() if name.endswith('.csv')), None)
-            if csv_name is None:
-                return None
-            
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                z.extract(csv_name, tmpdirname)
-                csv_full_path = os.path.join(tmpdirname, csv_name)
-                return pd.read_csv(csv_full_path)
-                
-    except Exception as e:
-        print(f"Error loading {zip_path}: {e}")
-        return None
-    
-
-
-def load_mc_data():
-    #Loading MC_dis, MC_lamdba
-    print("Loading MC data...")
-    
-    # Extract main zip file
-    with zipfile.ZipFile(top_zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_root)
-    
-    inner_zip_folder = os.path.join(extract_root, 'meson-strcutrue-2025-06-05-csv')
-    inner_zip_files = [os.path.join(inner_zip_folder, f) 
-                      for f in os.listdir(inner_zip_folder) if f.endswith('.zip')]
-    
-    print(f"Found {len(inner_zip_files)} zip files")
-    
-    # Organize data by kinematics and type
-    mc_part_data = defaultdict(list)
-    mc_dis_data = defaultdict(list)
-
-    
-    # Process files
-    for zip_path in inner_zip_files:
-        zip_filename = os.path.basename(zip_path)
-        process_name, kinematics, event_number, data_type = parse_filename(zip_filename)
+        # Read momentum components
+        px = tree["MCParticles.momentum.x"].array(library="np")
+        py = tree["MCParticles.momentum.y"].array(library="np")
+        pz = tree["MCParticles.momentum.z"].array(library="np")
         
-        if data_type == 'mc_part':
-            df = load_csv_from_zip(zip_path)
-            if df is not None:
-                df['event_file'] = event_number
-                mc_part_data[kinematics].append(df)
-        elif data_type == 'mc_dis':
-            df = load_csv_from_zip(zip_path)
-            if df is not None:
-                df['event_file'] = event_number
-                mc_dis_data[kinematics].append(df)
-    
-    # Combine data by kinematics
-    combined_data_MC = {}
-    for kinematics in mc_part_data:
-        if mc_part_data[kinematics] and mc_dis_data[kinematics]:
-            mc_part_combined = pd.concat(mc_part_data[kinematics], ignore_index=True)
-            mc_dis_combined = pd.concat(mc_dis_data[kinematics], ignore_index=True)
-            
-            combined_data_MC[kinematics] = {
-                'mc_part': mc_part_combined,
-                'mc_dis': mc_dis_combined
-            }
-            print(f"Kinematics {kinematics}: {len(mc_part_combined)} MC_PART, {len(mc_dis_combined)} MC_DIS events")
-    
-    return combined_data_MC
+        # Read mass and PDG codes
+        mass = tree["MCParticles.mass"].array(library="np")
+        pdg = tree["MCParticles.PDG"].array(library="np")
+        
+        # Ensure we don't exceed available data
+        actual_events = min(n_events, len(px))
+        
 
-# =============================================================================
-# T-VALUE CALCULATION FUNCTIONS
-# =============================================================================
+        
+        # Handle jagged arrays (multiple particles per event)
+        four_vectors = []
+        selected_indices = []
+        
+        for event_idx in range(n_events):
+            if event_idx < actual_events:
+                event_px = px[event_idx]
+                event_py = py[event_idx]
+                event_pz = pz[event_idx]
+                event_mass = mass[event_idx]
+                event_pdg = pdg[event_idx]
+                
+                if pdg_filter is not None:
+                    # Filter by PDG code
+                    mask = event_pdg == pdg_filter
+                    if np.any(mask):
+                        idx = np.where(mask)[0][0]  # Take first matching particle
+                        
+                        # Calculate energy: E = sqrt(p^2 + m^2)
+                        p_squared = event_px[idx]**2 + event_py[idx]**2 + event_pz[idx]**2
+                        energy = np.sqrt(p_squared + event_mass[idx]**2)
+                        
+                        four_vectors.append(np.array([energy, event_px[idx], event_py[idx], event_pz[idx]]))
+                        selected_indices.append(idx)
+                    else:
+                        four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                        selected_indices.append(-1)
+                else:
+                    # Take first particle in each event
+                    if len(event_px) > 0:
+                        # Calculate energy: E = sqrt(p^2 + m^2)
+                        p_squared = event_px[0]**2 + event_py[0]**2 + event_pz[0]**2
+                        energy = np.sqrt(p_squared + event_mass[0]**2)
+                        
+                        four_vectors.append(np.array([energy, event_px[0], event_py[0], event_pz[0]]))
+                        selected_indices.append(0)
+                    else:
+                        four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                        selected_indices.append(-1)
+            else:
+                # Pad with NaN for missing events
+                four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                selected_indices.append(-1)
+        
+        return np.array(four_vectors), selected_indices
+        
+    except Exception as e:
+        print(f"Error extracting MC particles: {e}")
+        # Return arrays of correct length filled with NaN
+        four_vectors = [np.array([np.nan, np.nan, np.nan, np.nan]) for _ in range(n_events)]
+        selected_indices = [-1] * n_events
+        return np.array(four_vectors), selected_indices
 
-def get_beam_energy_from_kinematics(kinematics):
-    """Extract beam energy from kinematics name"""
-    if kinematics.startswith('10x'):
-        return 10.0
-    elif kinematics.startswith('18x'):
-        return 18.0
-    elif kinematics.startswith('5x'):
-        return 5.0
+def get_beam_protons_4vectors(tree, n_events):
+    """
+    Get beam protons using MCBeamProtons_objIdx indices
+    
+    Args:
+        tree: uproot tree object
+        n_events: number of events to process (from main function)
+    
+    Returns:
+        four_vectors: array of 4-vectors [E, px, py, pz] for beam protons
+        selected_indices: list of MC particle indices used for each event
+    """
+    try:
+        # Check if the branch exists
+        branch_name = "MCBeamProtons_objIdx.index"
+        if branch_name not in tree:
+            print(f"  Warning: Branch '{branch_name}' not found in tree")
+            print(f"  Available branches related to 'Beam' or 'Proton':")
+            for branch in tree.keys():
+                if 'beam' in branch.lower() or 'proton' in branch.lower():
+                    print(f"    {branch}")
+            # Return arrays of correct length filled with NaN
+            four_vectors = [np.array([np.nan, np.nan, np.nan, np.nan]) for _ in range(n_events)]
+            selected_indices = [-1] * n_events
+            return np.array(four_vectors), selected_indices
+        
+        # Read beam proton indices
+        proton_indices = tree[branch_name].array(library="np")
+        
+        # Debug: Check proton indices
+        non_empty_indices = sum(1 for idx_array in proton_indices if len(idx_array) > 0)
+        print(f"  Debug: Events with beam proton indices: {non_empty_indices}/{len(proton_indices)}")
+        if non_empty_indices > 0:
+            # Show first few non-empty index arrays
+            for i, idx_array in enumerate(proton_indices[:10]):
+                if len(idx_array) > 0:
+                    print(f"    Event {i}: indices = {idx_array}")
+                    break
+        
+        # Read MCParticles data
+        px = tree["MCParticles.momentum.x"].array(library="np")
+        py = tree["MCParticles.momentum.y"].array(library="np")
+        pz = tree["MCParticles.momentum.z"].array(library="np")
+        mass = tree["MCParticles.mass"].array(library="np")
+        
+        # Ensure we don't exceed available data
+        actual_events = min(n_events, len(proton_indices), len(px))
+        if actual_events < n_events:
+            print(f"  Warning: Limited data available - using {actual_events} events out of {n_events}")
+        
+        four_vectors = []
+        selected_indices = []
+        
+        for event_idx in range(n_events):
+            if event_idx < actual_events:
+                event_proton_indices = proton_indices[event_idx]
+                event_px = px[event_idx]
+                event_py = py[event_idx]
+                event_pz = pz[event_idx]
+                event_mass = mass[event_idx]
+                
+                if len(event_proton_indices) > 0 and len(event_px) > 0:
+                    # Take first beam proton
+                    proton_idx = event_proton_indices[0]
+                    
+                    # Check if index is valid
+                    if 0 <= proton_idx < len(event_px):
+                        # Calculate energy: E = sqrt(p^2 + m^2)
+                        p_squared = event_px[proton_idx]**2 + event_py[proton_idx]**2 + event_pz[proton_idx]**2
+                        energy = np.sqrt(p_squared + event_mass[proton_idx]**2)
+                        
+                        four_vectors.append(np.array([energy, event_px[proton_idx], event_py[proton_idx], event_pz[proton_idx]]))
+                        selected_indices.append(proton_idx)
+                    else:
+                        four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                        selected_indices.append(-1)
+                else:
+                    four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                    selected_indices.append(-1)
+            else:
+                # Pad with NaN for missing events
+                four_vectors.append(np.array([np.nan, np.nan, np.nan, np.nan]))
+                selected_indices.append(-1)
+        
+        return np.array(four_vectors), selected_indices
+        
+    except Exception as e:
+        print(f"Error extracting beam protons: {e}")
+        # Return arrays of correct length filled with NaN
+        four_vectors = [np.array([np.nan, np.nan, np.nan, np.nan]) for _ in range(n_events)]
+        selected_indices = [-1] * n_events
+        return np.array(four_vectors), selected_indices
 
-
-def calculate_t_from_lambda_4vectors(mcpart_lambda, mc_dis, kinematics):
+def process_edm4eic_files(max_files=None):
+    """Process all EDM4eic files for 18x275 setting
     
-    #Take one DIS entry per event_file
-    dis_per_event = mc_dis.groupby('event_file')[['q2', 'nu']].first().reset_index()
+    Args:
+        max_files: Maximum number of files to process (None = all files)
+    """
     
-    #Merge lambda data with DIS kinematics
-    merged = mcpart_lambda.merge(
-        right = dis_per_event, 
-        on='event_file', 
-    )
+    # Find all available files
+    file_pattern = os.path.join(edm4eic_dir, "k_lambda_18x275_5000evt_*.edm4eic.root")
+    edm4eic_files = sorted(glob(file_pattern))
     
-    #Drop rows with missing values
-    merged = merged.dropna(subset=['lam_px', 'lam_py', 'lam_pz', 'q2', 'nu'])
-    
-    
-    #Extract momentum and DIS variables
-    px = merged['lam_px'].values
-    py = merged['lam_py'].values
-    pz = merged['lam_pz'].values
-    Q2 = merged['q2'].values 
-    nu = merged['nu'].values
-    
-    #Calculate lambda energy/virtual photon properties
-    lam_E = np.sqrt(px**2 + py**2 + pz**2 + M_LAMBDA**2)
-    gamma_E = nu
-    qmag = np.sqrt(nu**2 + Q2)
-    
-    #t = (q - p_lambda)²
-    #Virtual photon 4-momentum
-    dE = gamma_E - lam_E
-    dpx = -px  #gamma_px = 0
-    dpy = -py  #gamma_py = 0  
-    dpz = -qmag - pz  #gamma_pz = -qmag
-    
-    t = dE**2 - dpx**2 - dpy**2 - dpz**2
-    minus_t = -t
-    
-    # Keep only finite positive values
-    valid_t = minus_t[np.isfinite(minus_t) & (minus_t > 0)]
-    
-    return valid_t
-
-# =============================================================================
-# PLOTTING FUNCTIONS
-# =============================================================================
-
-def plot_t_distribution(all_t_values, kinematics_labels):
-    
-    if not all_t_values:
-        print("No data to plot")
+    if not edm4eic_files:
+        print(f"No EDM4eic files found in {edm4eic_dir}")
         return None
     
-    # Combine all t-values
-    combined_t = np.concatenate([t for t in all_t_values if t is not None])
+    print(f"\nFound {len(edm4eic_files)} EDM4eic files")
+    print("Files range:", os.path.basename(edm4eic_files[0]), "to", os.path.basename(edm4eic_files[-1]))
     
-    if len(combined_t) == 0:
-        print("No valid t-values to plot")
+    # Limit number of files if specified
+    if max_files is not None:
+        edm4eic_files = edm4eic_files[:max_files]
+        print(f"Processing first {len(edm4eic_files)} files...")
+    else:
+        print(f"Processing all {len(edm4eic_files)} files...")
+    
+    # Initialize lists to collect data
+    all_data = []
+    
+    for i, filepath in enumerate(edm4eic_files):
+        print(f"Processing file {i+1}/{len(edm4eic_files)}: {os.path.basename(filepath)}")
+        
+        try:
+            with uproot.open(filepath) as file:
+                # Use "events" tree (standard for EDM4eic)
+                tree_name = "events"
+                
+                if tree_name not in file:
+                    # Try alternative tree names
+                    available_keys = [k for k in file.keys() if not k.startswith('_')]
+                    if available_keys:
+                        tree_name = available_keys[0].replace(';1', '')
+                        print(f"  Using tree: {tree_name}")
+                    else:
+                        print(f"  No suitable tree found in {filepath}")
+                        continue
+                
+                tree = file[tree_name]
+                n_events = len(tree)
+                
+                # Extract segment number from filename
+                import re
+                match = re.search(r"5000evt_(\d+)\.edm4eic\.root", os.path.basename(filepath))
+                if match:
+                    segment = int(match.group(1))
+                else:
+                    segment = i + 1  # fallback
+                
+                # Calculate global event numbers
+                global_event_start = (segment - 1) * 5000
+                global_events = np.arange(global_event_start, global_event_start + n_events)
+                
+                print(f"  Events: {n_events}, Segment: {segment}")
+                
+                # Extract particle 4-vectors - pass n_events to ensure consistent array lengths
+                print("  Extracting beam protons...")
+                proton_4vec, proton_indices = get_beam_protons_4vectors(tree, n_events)
+                
+                print("  Extracting MC lambdas...")
+                lambda_mc_4vec, lambda_mc_indices = get_mc_particles_4vectors(tree, n_events, pdg_filter=PDG_LAMBDA)
+                
+                # Calculate t values if we have the required vectors
+                t_mc = np.full(n_events, np.nan)
+                
+                if proton_4vec is not None and lambda_mc_4vec is not None:
+                    print("  Computing MC t values...")
+                    
+                    # Debug: Check how many valid protons and lambdas we have
+                    valid_protons = np.sum(~np.isnan(proton_4vec[:, 0]))  # Check energy component
+                    valid_lambdas = np.sum(~np.isnan(lambda_mc_4vec[:, 0]))  # Check energy component
+                    print(f"    Valid beam protons: {valid_protons}/{n_events}")
+                    print(f"    Valid lambdas: {valid_lambdas}/{n_events}")
+                    
+                    # Debug: Show a few sample values
+                    if valid_protons > 0:
+                        first_valid_proton_idx = np.where(~np.isnan(proton_4vec[:, 0]))[0][0]
+                        print(f"    Sample beam proton 4-vec (event {first_valid_proton_idx}): {proton_4vec[first_valid_proton_idx]}")
+                    
+                    if valid_lambdas > 0:
+                        first_valid_lambda_idx = np.where(~np.isnan(lambda_mc_4vec[:, 0]))[0][0]
+                        print(f"    Sample lambda 4-vec (event {first_valid_lambda_idx}): {lambda_mc_4vec[first_valid_lambda_idx]}")
+                    
+                    valid_pairs = 0
+                    for j in range(n_events):
+                        if not (np.isnan(proton_4vec[j]).any() or np.isnan(lambda_mc_4vec[j]).any()):
+                            # Compute -t (negative t as requested)
+                            t_val = -mandelstam_t(proton_4vec[j], lambda_mc_4vec[j])
+                            t_mc[j] = t_val
+                            valid_pairs += 1
+                    
+                    print(f"    Events with both valid beam proton and lambda: {valid_pairs}/{n_events}")
+                    
+                    # Additional debugging for the first few valid events
+                    if valid_pairs > 0:
+                        print(f"    First few valid t values:")
+                        valid_t_vals = t_mc[~np.isnan(t_mc)][:5]  # Show first 5 valid values
+                        for k, t_val in enumerate(valid_t_vals):
+                            print(f"      t[{k}] = {t_val:.6f} GeV²")
+                else:
+                    print("    No valid 4-vectors found - cannot compute t values")
+                
+                # Create DataFrame for this file - ensure all arrays have length n_events
+                file_data = {
+                    "global_event": global_events,
+                    "event": np.arange(n_events),
+                    "segment": [segment] * n_events,
+                    "setting": ["18x275"] * n_events,
+                    "t_mc": t_mc,
+                }
+                
+                # Add 4-vector components if available
+                if proton_4vec is not None:
+                    file_data.update({
+                        "E_beam_proton": proton_4vec[:, 0],
+                        "px_beam_proton": proton_4vec[:, 1],
+                        "py_beam_proton": proton_4vec[:, 2],
+                        "pz_beam_proton": proton_4vec[:, 3],
+                        "beam_proton_mc_index": proton_indices,
+                    })
+                
+                if lambda_mc_4vec is not None:
+                    file_data.update({
+                        "E_lambda_mc": lambda_mc_4vec[:, 0],
+                        "px_lambda_mc": lambda_mc_4vec[:, 1],
+                        "py_lambda_mc": lambda_mc_4vec[:, 2],
+                        "pz_lambda_mc": lambda_mc_4vec[:, 3],
+                        "lambda_mc_index": lambda_mc_indices,
+                    })
+                
+                # Debug: Print array lengths before creating DataFrame
+                print(f"  Array lengths check:")
+                for key, value in file_data.items():
+                    if hasattr(value, '__len__'):
+                        print(f"    {key}: {len(value)}")
+                    else:
+                        print(f"    {key}: scalar")
+                
+                # Print summary
+                n_valid_mc = np.sum(~np.isnan(t_mc))
+                print(f"  Valid MC t values: {n_valid_mc}/{n_events}")
+                if n_valid_mc > 0:
+                    print(f"  t range: [{np.nanmin(t_mc):.3f}, {np.nanmax(t_mc):.3f}] GeV²")
+                
+                all_data.append(pd.DataFrame(file_data))
+                
+        except Exception as e:
+            print(f"Error processing {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    if all_data:
+        # Combine all data
+        result_df = pd.concat(all_data, ignore_index=True)
+        
+        # Save results
+        output_file = "mandelstam_minus_t_analysis_edm4eic_18x275_beam_protons.csv"
+        result_df.to_csv(output_file, index=False)
+        print(f"\nSaved combined data: {len(result_df)} events to {output_file}")
+        
+        # Create diagnostic plots
+        create_diagnostic_plots(result_df)
+        
+        return result_df
+    else:
+        print("No data was successfully processed")
         return None
-    
-    # Calculate statistics
-    mean_t = np.mean(combined_t)
-    std_t = np.std(combined_t)
-    
-    # Create figure
-    plt.figure(figsize=(12, 7))
-    
 
-    n_bins = 50
-    bin_range = None
+def create_diagnostic_plots(df):
+    plt.figure(figsize=(15, 10))
     
-    # Create histogram
-    counts, bins, patches = plt.hist(combined_t, bins=n_bins, range=bin_range,
-                                   alpha=0.7, color='black', 
-                                   linewidth=0.5, label='Truth')
+    # Plot t distributions
+    plt.subplot(2, 3, 1)
+    t_mc_vals = df["t_mc"].dropna()
     
-    #Formatting
-    plt.xlabel('t [GeV²]', fontsize=12)
-    plt.ylabel('Counts', fontsize=12)
-    plt.title('MC -t Distribution (MC Truth)', fontsize=14)
-    plt.grid(True, alpha=0.3)
+    if len(t_mc_vals) > 0:
+        plt.hist(t_mc_vals, bins=50, alpha=0.7, color='red')
+        plt.xlabel("-t [GeV²]")
+        plt.ylabel("Counts")
+        plt.title(f"MC -t distribution (18x275)\nN = {len(t_mc_vals)} events")
+        plt.legend()
+        plt.grid(True)
+        
+        # Add statistics
+        mean_t = t_mc_vals.mean()
+        std_t = t_mc_vals.std()
+        plt.text(0.05, 0.95, f'Mean: {mean_t:.3f} GeV²\nStd: {std_t:.3f} GeV²', 
+                transform=plt.gca().transAxes, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
-    #statistics box
-    stats_text = f'Truth Mean = {mean_t:.3f}\nTruth Std Dev = {std_t:.3f}'
-    plt.text(0.65, 0.85, stats_text, transform=plt.gca().transAxes,
-             bbox=dict(boxstyle='round', facecolor='blue', alpha=0.8),
-             verticalalignment='top', fontsize=10)
+    # Plot beam proton energy distribution
+    plt.subplot(2, 3, 2)
+    if "E_beam_proton" in df.columns:
+        proton_E = df["E_beam_proton"].dropna()
+        if len(proton_E) > 0:
+            plt.hist(proton_E, bins=50, alpha=0.7, color='red')
+            plt.xlabel("Beam Proton Energy [GeV]")
+            plt.ylabel("Counts")
+            plt.title("Beam Proton Energy")
+            plt.grid(True)
+        # Plot lambda energy distribution
+        
+    plt.subplot(2, 3, 3)
+    if "E_lambda_mc" in df.columns:
+        lambda_E = df["E_lambda_mc"].dropna()
+        if len(lambda_E) > 0:
+            plt.hist(lambda_E, bins=50, alpha=0.7, color='green')
+            plt.xlabel("Lambda Energy [GeV]")
+            plt.ylabel("Counts")
+            plt.title("MC Lambda Energy")
+            plt.grid(True)
     
-    # Add legend
-    plt.legend(loc='upper right')
     
     plt.tight_layout()
-    
-    print(f"\nPlot Statistics:")
-    print(f"Total events: {len(combined_t)}")
-    print(f"Mean t: {mean_t:.6f} GeV²")
-    print(f"Std Dev t: {std_t:.6f} GeV²")
-    print(f"Min t: {np.min(combined_t):.6f} GeV²")
-    print(f"Max t: {np.max(combined_t):.6f} GeV²")
-    print(f"Range: {np.max(combined_t) - np.min(combined_t):.6f} GeV²")
-    
-    # Check if distribution looks like the original
-    if mean_t > 0 and np.abs(mean_t) > 1000:
-        print("\n⚠️  WARNING: t-values are large and positive.")
-        print("   Original shows small negative values around -150.")
-        print("   This suggests a units or calculation issue.")
-    elif mean_t < 0 and np.abs(mean_t) < 1000:
-        print("\n✓ t-values look similar to original distribution")
-    
-    return plt.gcf()
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("="*60)
-    print("MC TRUTH T-VALUES HISTOGRAM PLOTTER")
-    print("="*60)
-    
-    try:
-        # Load MC data (both MC_PART and MC_DIS)
-        mc_data = load_mc_data()
-        
-        if not mc_data:
-            print("No MC data found!")
-            return
-        
-        # Calculate t-values for each kinematics
-        all_t_values = []
-        kinematics_labels = []
-        
-        for kinematics in sorted(mc_data.keys()):
-            print(f"\nProcessing kinematics: {kinematics}")
-            mc_part = mc_data[kinematics]['mc_part']
-            mc_dis = mc_data[kinematics]['mc_dis']
-            
-            # Debug: Show available columns
-            print(f"MC_PART columns: {list(mc_part.columns)}")
-            print(f"MC_DIS columns: {list(mc_dis.columns)}")
-            
-            # Check for t-related columns in MC_PART
-            t_cols = [col for col in mc_part.columns if 't' in col.lower()]
-            if t_cols:
-                print(f"Columns containing 't' in MC_PART: {t_cols}")
-            
-            t_values = calculate_t_from_lambda_4vectors(mc_part, mc_dis, kinematics)
-            
-            if t_values is not None:
-                all_t_values.append(t_values)
-                kinematics_labels.append(kinematics)
-                print(f"✓ Successfully extracted {len(t_values)} t-values for {kinematics}")
-            else:
-                print("Could not calculate t-values for {kinematics}")
-        
-        print(f"\nSummary: Successfully processed {len(all_t_values)} out of {len(mc_data)} kinematics")
-        
-        # Create and display plot
-        if all_t_values:
-            fig = plot_t_distribution(all_t_values, kinematics_labels)
-            
-            if fig is not None:
-                # Save plot
-                output_filename = 'mc_truth_t_distribution.png'
-                fig.savefig(output_filename, dpi=300, bbox_inches='tight')
-                print(f"\n✓ Plot saved as: {output_filename}")
-                
-                # Show plot
-                plt.show()
-            else:
-                print("Could not create plot")
-        else:
-            print("No valid t-values calculated from any kinematics")
-    
-    except Exception as e:
-        print(f"Error during analysis: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    finally:
-        # Cleanup temporary files
-        if os.path.exists(extract_root):
-            shutil.rmtree(extract_root)
-            print("✓ Cleaned up temporary files")
+    plt.savefig("edm4eic_analysis_minus_t_diagnostics_18x275_beam_protons.png", dpi=300, bbox_inches='tight')
+    plt.show()
 
 if __name__ == "__main__":
-    main()
+    # Configuration
+    TEST_MODE = False  # Set to True to process only first 20 files for testing
+    
+    print("=== EDM4eic ROOT File Analysis ===")
+    print("Calculating Mandelstam -t values from MC beam protons and lambdas")
+    
+    # Run the analysis
+    max_files = 20 if TEST_MODE else None
+    result_df = process_edm4eic_files(max_files=max_files)
+    
+    if result_df is not None:
+        print("\nAnalysis completed successfully!")
+        print(f"Total events processed: {len(result_df)}")
+        print(f"Events with MC -t: {(~result_df['t_mc'].isna()).sum()}")
+        
+        # Show some statistics
+        if (~result_df['t_mc'].isna()).sum() > 0:
+            mc_t_vals = result_df['t_mc'].dropna()
+            print(f"MC -t range: [{mc_t_vals.min():.3f}, {mc_t_vals.max():.3f}] GeV²")
+            print(f"MC -t mean: {mc_t_vals.mean():.3f} ± {mc_t_vals.std():.3f} GeV²")
+            
+            # Show first few valid events
+            valid_events = result_df[~result_df['t_mc'].isna()].head()
+            print("\nFirst few valid events:")
+            print(valid_events[['global_event', 't_mc', 'E_beam_proton', 'E_lambda_mc']].to_string())
+    else:
+        print("Analysis failed - please check the file paths and ROOT file structure")
